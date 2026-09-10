@@ -79,8 +79,9 @@ STANDARD_SERVICE_KEYS = frozenset({
 })
 
 # Mesh channel → external target mappings in bridge service sections.
-BRIDGE_SECTIONS = frozenset({"DiscordBridge", "TelegramBridge"})
+BRIDGE_SECTIONS = frozenset({"DiscordBridge", "TelegramBridge", "MatrixBridge"})
 BRIDGE_CHANNEL_KEY_PREFIX = "bridge."
+MATRIX_INBOUND_KEY_PREFIX = "inbound."
 
 # User-defined announcement triggers in Announcements_Command.
 ANNOUNCEMENTS_TRIGGER_KEY_PREFIX = "announce."
@@ -311,6 +312,11 @@ def is_bridge_channel_key(section: str, key: str) -> bool:
     return section in BRIDGE_SECTIONS and key.startswith(BRIDGE_CHANNEL_KEY_PREFIX)
 
 
+def is_matrix_inbound_key(section: str, key: str) -> bool:
+    """Return True for Matrix per-channel inbound enablement keys."""
+    return section == "MatrixBridge" and key.startswith(MATRIX_INBOUND_KEY_PREFIX)
+
+
 def is_announcements_trigger_key(section: str, key: str) -> bool:
     """Return True for dynamic announce.<trigger_name> keys."""
     return (
@@ -382,6 +388,8 @@ def is_known_config_key(
     if section_meta and lowered in {k.lower() for k in section_meta.keys}:
         return True
     if is_mqtt_broker_key(section, lowered, example_keys):
+        return True
+    if is_matrix_inbound_key(section, lowered):
         return True
     if is_dynamic_suffix_key(section, lowered):
         return True

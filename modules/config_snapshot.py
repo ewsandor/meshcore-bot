@@ -21,6 +21,7 @@ _REDACT_KEY_PARTS: tuple[str, ...] = (
 # the channel name and there is no fixed stem for the substring rule to catch.
 _REDACT_KEY_PREFIXES: tuple[str, ...] = (
     "bridge.",
+    "access_token",
 )
 
 

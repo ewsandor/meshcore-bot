@@ -672,6 +672,7 @@ class MeshCoreBot:
             "Connection",
             "DARC_MoWaS_Service",
             "DiscordBridge",
+            "MatrixBridge",
             "Earthquake_Service",
             "Feed_Manager",
             "Logging",

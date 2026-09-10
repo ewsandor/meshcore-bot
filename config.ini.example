@@ -2367,6 +2367,35 @@ avatar_style = color
 #
 # Fan out a single MeshCore channel to multiple Discord servers
 # bridge.Public = https://discord.com/api/webhooks/AAA/aaa..., https://discord.com/api/webhooks/BBB/bbb...
+[MatrixBridge]
+# Enable Matrix bridge service. matrix-nio is optional at runtime; when absent,
+# the service logs an error and remains disabled without affecting MeshCore Bot.
+enabled = false
+
+# Matrix homeserver and bot identity. Use a dedicated Matrix account.
+# homeserver = https://matrix.example.org
+# user_id = @meshcore-bot:example.org
+# access_token = SET_THIS_IN_YOUR_LOCAL_CONFIG
+# MATRIX_ACCESS_TOKEN may be used instead of access_token.
+
+# Keep these stable for encrypted rooms. The store path must be writable and persistent.
+# device_id = MESHCOREBOT
+# store_path = data/matrix-store
+# encryption_enabled = true
+
+# Optional settings
+# max_message_length = 4096
+# filter_profanity = drop
+# bridge_bot_responses = true
+
+# Map MeshCore channels to Matrix room IDs. DMs are never bridged.
+# bridge.Public = !roomid:example.org
+# bridge.emergency = !anotherroom:example.org
+
+# Optional Matrix -> MeshCore routing, enabled independently per channel.
+# inbound.Public = true
+# inbound.emergency = false
+
 [TelegramBridge]
 # Enable Telegram bridge service
 # Posts MeshCore channel messages to Telegram via the Bot API (one-way, read-only)
