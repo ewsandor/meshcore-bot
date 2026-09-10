@@ -9,24 +9,45 @@ client code is intentionally isolated in this service module.
 import asyncio
 import contextlib
 import copy
+import json
 import os
+import re
+import secrets
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
 
 from meshcore import EventType
 
 try:
-    from nio import AsyncClient, AsyncClientConfig, RoomMessageText
+    from nio import (
+        AsyncClient,
+        AsyncClientConfig,
+        KeyVerificationAccept,
+        KeyVerificationCancel,
+        KeyVerificationEvent,
+        KeyVerificationKey,
+        KeyVerificationMac,
+        RoomMessageText,
+        ToDeviceError,
+    )
     MATRIX_NIO_AVAILABLE = True
 except ImportError:
     AsyncClient = None  # type: ignore[assignment,misc]
     AsyncClientConfig = None  # type: ignore[assignment,misc]
+    KeyVerificationAccept = object  # type: ignore[assignment,misc]
+    KeyVerificationCancel = object  # type: ignore[assignment,misc]
+    KeyVerificationEvent = object  # type: ignore[assignment,misc]
+    KeyVerificationKey = object  # type: ignore[assignment,misc]
+    KeyVerificationMac = object  # type: ignore[assignment,misc]
     RoomMessageText = object  # type: ignore[assignment,misc]
+    ToDeviceError = object  # type: ignore[assignment,misc]
     MATRIX_NIO_AVAILABLE = False
 
 from ..profanity_filter import censor, contains_profanity
+from ..security_utils import validate_pubkey_format
 from .base_service import BaseServicePlugin
 
 MATRIX_MAX_MESSAGE_LENGTH = 4096
@@ -50,6 +71,21 @@ class QueuedMessage:
             self.first_queued = now
         if self.next_retry_at == 0.0:
             self.next_retry_at = now
+
+
+@dataclass
+class PendingVerification:
+    """Temporary state for one Matrix-to-MeshCore verification attempt."""
+
+    matrix_user_id: str
+    matrix_room_id: str
+    meshcore_public_key: str
+    challenge: str
+    created_at: float
+    expires_at: float
+    stage: str = "mesh_challenge"
+    transaction_id: Optional[str] = None
+    matrix_device_id: Optional[str] = None
 
 
 class MatrixBridgeService(BaseServicePlugin):
@@ -81,6 +117,11 @@ class MatrixBridgeService(BaseServicePlugin):
          "default": "drop", "help": "How to handle profanity in messages and usernames."},
         {"key": "bridge_bot_responses", "label": "Bridge bot responses", "type": "bool",
          "default": True, "help": "Also bridge the bot's own channel replies."},
+        {"key": "verification_enabled", "label": "Enable identity verification", "type": "bool",
+         "default": True, "help": "Allow Matrix users to link and verify a MeshCore identity."},
+        {"key": "verification_timeout_seconds", "label": "Verification timeout", "type": "int",
+         "min": 30, "max": 3600, "default": 300,
+         "help": "Seconds before a pending identity or SAS verification expires."},
     ]
     settings_dynamic_sections = [
         {"section": "MatrixBridge", "key_prefix": "bridge.",
@@ -112,6 +153,11 @@ class MatrixBridgeService(BaseServicePlugin):
         raw_filter = config.get(self.config_section, "filter_profanity", fallback="drop").strip().lower()
         self.filter_profanity = raw_filter if raw_filter in ("drop", "censor", "off") else "drop"
         self.bridge_bot_responses = config.getboolean(self.config_section, "bridge_bot_responses", fallback=True)
+        self.verification_enabled = config.getboolean(self.config_section, "verification_enabled", fallback=True)
+        self.verification_timeout_seconds = min(
+            max(30, config.getint(self.config_section, "verification_timeout_seconds", fallback=300)),
+            3600,
+        )
         self.channel_rooms: dict[str, str] = {}
         self.inbound_channels: set[str] = set()
         self._load_channel_mappings()
@@ -125,6 +171,11 @@ class MatrixBridgeService(BaseServicePlugin):
         self.max_retries = 5
         self.retry_delay_base = 1.0
         self.max_queue_age = 300
+        self.pending_verifications: dict[str, PendingVerification] = {}
+        self._linked_meshcore_keys: dict[str, str] = {}
+        self._verification_tasks: dict[str, asyncio.Task] = {}
+        self._verification_state_path = Path(self.store_path) / "meshcore-links.json"
+        self._load_linked_identities()
 
         if not MATRIX_NIO_AVAILABLE:
             self.logger.error("matrix-nio is not installed. Matrix bridge is disabled.")
@@ -146,6 +197,220 @@ class MatrixBridgeService(BaseServicePlugin):
         for room_id in self.channel_rooms.values():
             self.message_queues.setdefault(room_id, [])
             self.send_times.setdefault(room_id, deque())
+
+    def _load_linked_identities(self) -> None:
+        try:
+            with self._verification_state_path.open(encoding="utf-8") as state_file:
+                loaded = json.load(state_file)
+            if isinstance(loaded, dict):
+                self._linked_meshcore_keys = {
+                    str(matrix_user): str(mesh_key).lower()
+                    for matrix_user, mesh_key in loaded.items()
+                    if validate_pubkey_format(str(mesh_key))
+                }
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            self._linked_meshcore_keys = {}
+
+    def _save_linked_identities(self) -> None:
+        try:
+            self._verification_state_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path = self._verification_state_path.with_suffix(".tmp")
+            with temporary_path.open("w", encoding="utf-8") as state_file:
+                json.dump(self._linked_meshcore_keys, state_file, indent=2, sort_keys=True)
+            temporary_path.replace(self._verification_state_path)
+        except OSError as exc:
+            self.logger.error("Could not save Matrix/MeshCore identity links: %s", exc)
+
+    def _find_pending_by_mesh_key(self, public_key: str) -> Optional[PendingVerification]:
+        normalized = public_key.lower()
+        return next(
+            (pending for pending in self.pending_verifications.values()
+             if pending.meshcore_public_key.lower() == normalized),
+            None,
+        )
+
+    def _resolve_meshcore_public_key(self, prefix: str) -> Optional[str]:
+        normalized = prefix.strip().lower()
+        if validate_pubkey_format(normalized):
+            return normalized
+        contacts = getattr(self.bot.meshcore, "contacts", {}) or {}
+        for contact in contacts.values():
+            public_key = str(contact.get("public_key", "")).lower()
+            if public_key and public_key.startswith(normalized) and validate_pubkey_format(public_key):
+                return public_key
+        return None
+
+    async def _send_matrix_status(self, room_id: str, text: str) -> None:
+        await self._queue_message(room_id, f"[Matrix verification] {text}", "verification")
+
+    async def _handle_matrix_control_message(self, room: Any, event: Any) -> bool:
+        if not self.verification_enabled or event.sender == self.user_id:
+            return False
+        content = event.body.strip()
+        if content.lower() in ("help", "matrix help", "link help"):
+            await self._send_matrix_status(
+                room.room_id,
+                "Commands:\n"
+                "link meshcore <64-character public key> - link and verify your MeshCore identity\n"
+                "link status - show the current link\n"
+                "unlink meshcore - remove the current link",
+            )
+            return True
+        if content.lower() == "link status":
+            linked_key = self._linked_meshcore_keys.get(event.sender)
+            status = (
+                f"Linked to MeshCore identity {linked_key[:12]}..."
+                if linked_key else "No MeshCore identity is linked to this Matrix account."
+            )
+            await self._send_matrix_status(room.room_id, status)
+            return True
+        if content.lower() == "unlink meshcore":
+            if self._linked_meshcore_keys.pop(event.sender, None) is not None:
+                self._save_linked_identities()
+                status = "Your MeshCore identity link has been removed."
+            else:
+                status = "No MeshCore identity was linked to this Matrix account."
+            await self._send_matrix_status(room.room_id, status)
+            return True
+        match = re.fullmatch(r"link\s+meshcore\s+([0-9a-fA-F]{64})", content, re.IGNORECASE)
+        if not match:
+            return False
+
+        public_key = match.group(1).lower()
+        existing_key = self._linked_meshcore_keys.get(event.sender)
+        if existing_key and existing_key != public_key:
+            await self._send_matrix_status(
+                room.room_id,
+                "This Matrix account is already linked to another MeshCore identity. "
+                "Use `unlink meshcore` through an administrator before changing it.",
+            )
+            return True
+        if self._find_pending_by_mesh_key(public_key):
+            await self._send_matrix_status(room.room_id, "A verification request for that MeshCore identity is already pending.")
+            return True
+
+        now = time.time()
+        challenge = secrets.token_hex(4).upper()
+        pending = PendingVerification(
+            matrix_user_id=event.sender,
+            matrix_room_id=room.room_id,
+            meshcore_public_key=public_key,
+            challenge=challenge,
+            created_at=now,
+            expires_at=now + self.verification_timeout_seconds,
+            matrix_device_id=(event.source.get("unsigned", {}).get("device_id")
+                              if isinstance(getattr(event, "source", None), dict) else None),
+        )
+        self.pending_verifications[event.sender] = pending
+        sent = await self.bot.command_manager.send_dm(
+            public_key,
+            f"MATRIX LINK {challenge}\\nReply: VERIFY {challenge}",
+            skip_user_rate_limit=True,
+        )
+        if not sent:
+            self.pending_verifications.pop(event.sender, None)
+            await self._send_matrix_status(
+                room.room_id,
+                "I could not reach that MeshCore public key. Send a MeshCore message to the bot first, then retry.",
+            )
+            return True
+        await self._send_matrix_status(
+            room.room_id,
+            "A one-time challenge was sent over MeshCore. Reply to it with the requested text; "
+            f"this request expires in {self.verification_timeout_seconds // 60} minutes.",
+        )
+        asyncio.create_task(self._expire_pending_verification(event.sender, pending.expires_at))
+        return True
+
+    async def _expire_pending_verification(self, matrix_user_id: str, expires_at: float) -> None:
+        await asyncio.sleep(max(0, expires_at - time.time()))
+        pending = self.pending_verifications.get(matrix_user_id)
+        if pending and pending.expires_at <= time.time():
+            if pending.transaction_id:
+                with contextlib.suppress(Exception):
+                    await self.client.cancel_key_verification(pending.transaction_id)
+                self._verification_tasks.pop(pending.transaction_id, None)
+            self.pending_verifications.pop(matrix_user_id, None)
+            await self._send_matrix_status(pending.matrix_room_id, "Verification timed out.")
+
+    async def _start_matrix_verification(self, pending: PendingVerification) -> None:
+        response = await self.client.keys_query()
+        devices = getattr(response, "device_keys", {}).get(pending.matrix_user_id, {})
+        if pending.matrix_device_id and pending.matrix_device_id in devices:
+            device = devices[pending.matrix_device_id]
+        elif len(devices) == 1:
+            device = next(iter(devices.values()))
+            pending.matrix_device_id = getattr(device, "device_id", None)
+        else:
+            await self._send_matrix_status(
+                pending.matrix_room_id,
+                "I found multiple Matrix devices. Start emoji verification from the Matrix device "
+                "you want to verify, or retry from a direct encrypted Matrix chat.",
+            )
+            return
+        transaction_id = secrets.token_hex(16)
+        response = await self.client.start_key_verification(device, transaction_id)
+        if isinstance(response, ToDeviceError):
+            await self._send_matrix_status(pending.matrix_room_id, "Matrix verification could not be started.")
+            return
+        pending.transaction_id = transaction_id
+        pending.stage = "matrix_sas"
+        await self._send_matrix_status(
+            pending.matrix_room_id,
+            "Matrix emoji verification has started. I will send my emoji sequence over MeshCore.",
+        )
+
+    async def _send_sas_over_meshcore(self, pending: PendingVerification) -> None:
+        sas = self.client.key_verifications.get(pending.transaction_id or "")
+        if not sas:
+            return
+        emoji_text = " ".join(emoji for emoji, _description in sas.get_emoji())
+        sent = await self.bot.command_manager.send_dm(
+            pending.meshcore_public_key,
+            f"MATRIX EMOJIS {emoji_text}\\nReply: YES {pending.challenge} or NO {pending.challenge}",
+            skip_user_rate_limit=True,
+        )
+        if sent:
+            pending.stage = "mesh_sas_confirmation"
+            await self._send_matrix_status(
+                pending.matrix_room_id,
+                "Compare the emojis sent over MeshCore with the emojis shown by your Matrix client, "
+                "then reply over MeshCore with YES or NO.",
+            )
+        else:
+            await self._send_matrix_status(pending.matrix_room_id, "I could not send the emoji sequence over MeshCore.")
+
+    async def _on_mesh_verification_message(self, event: Any, metadata: Any = None) -> None:
+        payload = copy.deepcopy(getattr(event, "payload", None))
+        if not payload:
+            return
+        public_key = self._resolve_meshcore_public_key(str(payload.get("pubkey_prefix", "")))
+        if not public_key:
+            return
+        pending = self._find_pending_by_mesh_key(public_key)
+        if not pending or pending.expires_at <= time.time():
+            return
+        text = str(payload.get("text", "")).strip()
+        if pending.stage == "mesh_challenge":
+            if text.upper() != f"VERIFY {pending.challenge}":
+                return
+            await self._start_matrix_verification(pending)
+            return
+        if pending.stage != "mesh_sas_confirmation":
+            return
+        if text.upper() == f"NO {pending.challenge}":
+            with contextlib.suppress(Exception):
+                await self.client.cancel_key_verification(pending.transaction_id or "", reject=True)
+            await self._send_matrix_status(pending.matrix_room_id, "Verification was rejected over MeshCore.")
+            self.pending_verifications.pop(pending.matrix_user_id, None)
+            return
+        if text.upper() != f"YES {pending.challenge}":
+            return
+        response = await self.client.confirm_short_auth_string(pending.transaction_id or "")
+        if isinstance(response, ToDeviceError):
+            await self._send_matrix_status(pending.matrix_room_id, "Matrix could not confirm the emoji verification.")
+            return
+        pending.stage = "matrix_mac"
 
     def _channel_for_room(self, room_id: str) -> Optional[str]:
         for channel, mapped_room in self.channel_rooms.items():
@@ -189,10 +454,14 @@ class MatrixBridgeService(BaseServicePlugin):
         )
         self.client.access_token = self.access_token
         self.client.add_event_callback(self._on_matrix_message, RoomMessageText)
+        if self.verification_enabled and self.encryption_enabled:
+            self.client.add_to_device_callback(self._on_matrix_verification_event, KeyVerificationEvent)
         self._running = True
         self._sync_task = asyncio.create_task(self._sync_matrix())
         if self.bot.meshcore:
             self.bot.meshcore.subscribe(EventType.CHANNEL_MSG_RECV, self._on_mesh_channel_message)
+            if self.verification_enabled:
+                self.bot.meshcore.subscribe(EventType.CONTACT_MSG_RECV, self._on_mesh_verification_message)
         if self.bridge_bot_responses and getattr(self.bot, "channel_sent_listeners", None) is not None:
             self.bot.channel_sent_listeners.append(self._on_mesh_channel_message)
         self._queue_processor_task = asyncio.create_task(self._process_message_queues())
@@ -216,9 +485,19 @@ class MatrixBridgeService(BaseServicePlugin):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        for task in self._verification_tasks.values():
+            task.cancel()
+        self._verification_tasks.clear()
         if self.client:
             await self.client.close()
             self.client = None
+
+    async def on_transport_reconnected(self) -> None:
+        if not self._running or not getattr(self.bot, "meshcore", None):
+            return
+        self.bot.meshcore.subscribe(EventType.CHANNEL_MSG_RECV, self._on_mesh_channel_message)
+        if self.verification_enabled:
+            self.bot.meshcore.subscribe(EventType.CONTACT_MSG_RECV, self._on_mesh_verification_message)
 
     async def _on_mesh_channel_message(self, event: Any, metadata: Any = None) -> None:
         payload = copy.deepcopy(getattr(event, "payload", None))
@@ -244,6 +523,7 @@ class MatrixBridgeService(BaseServicePlugin):
 
     async def _queue_message(self, room_id: str, body: str, channel: str) -> None:
         self.message_queues.setdefault(room_id, []).append(QueuedMessage(room_id, body, channel))
+        self.send_times.setdefault(room_id, deque())
 
     async def _process_message_queues(self) -> None:
         while self._running:
@@ -279,6 +559,8 @@ class MatrixBridgeService(BaseServicePlugin):
             return False
 
     async def _on_matrix_message(self, room: Any, event: Any) -> None:
+        if await self._handle_matrix_control_message(room, event):
+            return
         channel = self._channel_for_room(room.room_id)
         if (
             not channel
@@ -318,3 +600,54 @@ class MatrixBridgeService(BaseServicePlugin):
                 "Message could not be sent to MeshCore, possibly because of radio or rate limits.",
                 channel,
             )
+
+    async def _on_matrix_verification_event(self, event: Any) -> None:
+        transaction_id = getattr(event, "transaction_id", None)
+        if not transaction_id:
+            return
+        pending = next(
+            (candidate for candidate in self.pending_verifications.values()
+             if candidate.transaction_id == transaction_id),
+            None,
+        )
+        if not pending or event.sender != pending.matrix_user_id:
+            return
+        if isinstance(event, KeyVerificationAccept):
+            sas = self.client.key_verifications.get(transaction_id)
+            if not sas:
+                return
+            response = await self.client.to_device(sas.share_key())
+            if isinstance(response, ToDeviceError):
+                await self._send_matrix_status(pending.matrix_room_id, "Matrix verification could not exchange keys.")
+            return
+        if isinstance(event, KeyVerificationKey):
+            await self._send_sas_over_meshcore(pending)
+            return
+        if isinstance(event, KeyVerificationMac):
+            sas = self.client.key_verifications.get(transaction_id)
+            if not sas:
+                return
+            with contextlib.suppress(Exception):
+                response = await self.client.to_device(sas.get_mac())
+                if isinstance(response, ToDeviceError):
+                    await self._send_matrix_status(pending.matrix_room_id, "Matrix verification could not complete.")
+                    return
+            self._linked_meshcore_keys[pending.matrix_user_id] = pending.meshcore_public_key
+            self._save_linked_identities()
+            await self._send_matrix_status(
+                pending.matrix_room_id,
+                f"Verification succeeded. This Matrix account is now linked to MeshCore {pending.meshcore_public_key[:12]}....",
+            )
+            await self.bot.command_manager.send_dm(
+                pending.meshcore_public_key,
+                "Matrix verification succeeded; your MeshCore identity is linked.",
+                skip_user_rate_limit=True,
+            )
+            self.pending_verifications.pop(pending.matrix_user_id, None)
+            return
+        if isinstance(event, KeyVerificationCancel):
+            await self._send_matrix_status(
+                pending.matrix_room_id,
+                f"Verification failed or was cancelled: {getattr(event, 'reason', 'unknown reason')}.",
+            )
+            self.pending_verifications.pop(pending.matrix_user_id, None)

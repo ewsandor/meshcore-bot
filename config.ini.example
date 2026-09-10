@@ -2387,6 +2387,8 @@ enabled = false
 # max_message_length = 4096
 # filter_profanity = drop
 # bridge_bot_responses = true
+# verification_enabled = true
+# verification_timeout_seconds = 300
 
 # Map MeshCore channels to Matrix room IDs. DMs are never bridged.
 # bridge.Public = !roomid:example.org

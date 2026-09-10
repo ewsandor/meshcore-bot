@@ -37,3 +37,23 @@ never bridges MeshCore DMs, and applies the configured profanity filter in both
 directions. Matrix messages routed to MeshCore are split into ordered UTF-8
 chunks no larger than the MeshCore 133-byte channel-message limit and use the
 bot's standard chunk pacing and transmission rate limiting.
+
+## Identity verification
+
+When `verification_enabled = true`, a user can start a cross-network identity
+link from a Matrix DM:
+
+```text
+link meshcore <64-character MeshCore public key>
+```
+
+The bot sends a one-time challenge to that MeshCore public key. After the user
+replies over MeshCore, the bot starts Matrix SAS verification, sends its emoji
+sequence over the authenticated MeshCore DM, and waits for `YES <challenge>` or
+`NO <challenge>`. The bot confirms the Matrix transaction only after `YES` and
+persists the resulting Matrix-user-to-MeshCore-key association in the Matrix
+crypto store directory.
+
+The emoji comparison is deliberately cross-network: the Matrix client displays
+its sequence, while the bot sends its sequence over MeshCore. Challenges expire
+according to `verification_timeout_seconds` and are never stored as secrets.
