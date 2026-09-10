@@ -34,4 +34,6 @@ inbound.Public = false
 Set `inbound.<channel> = true` only for channels that should accept Matrix
 messages. The bridge ignores the bot's own Matrix messages to prevent loops,
 never bridges MeshCore DMs, and applies the configured profanity filter in both
-directions.
+directions. Matrix messages routed to MeshCore are split into ordered UTF-8
+chunks no larger than the MeshCore 133-byte channel-message limit and use the
+bot's standard chunk pacing and transmission rate limiting.

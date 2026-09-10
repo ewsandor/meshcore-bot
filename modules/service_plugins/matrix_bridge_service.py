@@ -30,6 +30,7 @@ from ..profanity_filter import censor, contains_profanity
 from .base_service import BaseServicePlugin
 
 MATRIX_MAX_MESSAGE_LENGTH = 4096
+MESHCORE_CHANNEL_MESSAGE_MAX_BYTES = 133
 
 
 @dataclass
@@ -285,6 +286,10 @@ class MatrixBridgeService(BaseServicePlugin):
         if filtered is None:
             return
         sender, body = filtered
-        await self.bot.command_manager.send_channel_message(
-            channel, self._truncate(f"{sender}: {body}"), skip_user_rate_limit=True,
+        message = self._truncate(f"{sender}: {body}")
+        chunks = self.bot.command_manager.split_text_into_utf8_chunks(
+            message, MESHCORE_CHANNEL_MESSAGE_MAX_BYTES
+        )
+        await self.bot.command_manager.send_channel_messages_chunked(
+            channel, chunks, skip_user_rate_limit=True,
         )
