@@ -158,6 +158,10 @@ class MatrixBridgeService(BaseServicePlugin):
             return text
         return text[: self.max_message_length - 3].rstrip() + "..."
 
+    async def _queue_matrix_notice(self, room_id: str, notice: str, channel: str) -> None:
+        """Tell the Matrix room how an inbound message was handled."""
+        await self._queue_message(room_id, f"[Matrix bridge] {notice}", channel)
+
     def _format_outbound(self, sender: str, text: str, channel: str) -> str:
         text = text.replace("@[", "@").replace("]", "")
         return self._truncate(f"[{channel}] {sender}: {text}")
@@ -286,10 +290,31 @@ class MatrixBridgeService(BaseServicePlugin):
         if filtered is None:
             return
         sender, body = filtered
-        message = self._truncate(f"{sender}: {body}")
+        original_message = f"{sender}: {body}"
+        message = self._truncate(original_message)
+        was_truncated = message != original_message
         chunks = self.bot.command_manager.split_text_into_utf8_chunks(
             message, MESHCORE_CHANNEL_MESSAGE_MAX_BYTES
         )
-        await self.bot.command_manager.send_channel_messages_chunked(
+        sent = await self.bot.command_manager.send_channel_messages_chunked(
             channel, chunks, skip_user_rate_limit=True,
         )
+        if was_truncated:
+            await self._queue_matrix_notice(
+                room.room_id,
+                f"Message from {sender} was truncated to {self.max_message_length} characters "
+                "before sending to MeshCore.",
+                channel,
+            )
+        elif len(chunks) > 1:
+            await self._queue_matrix_notice(
+                room.room_id,
+                f"Message from {sender} was split into {len(chunks)} MeshCore messages.",
+                channel,
+            )
+        if not sent:
+            await self._queue_matrix_notice(
+                room.room_id,
+                "Message could not be sent to MeshCore, possibly because of radio or rate limits.",
+                channel,
+            )
