@@ -4,27 +4,8 @@ The Matrix bridge is a built-in service plugin that uses `matrix-nio` to send
 MeshCore channel messages to Matrix rooms. Matrix-to-MeshCore routing is
 disabled by default and can be enabled for individual mapped channels.
 
-## Fedora installation
-
-Use the bot's project virtual environment so the system Python remains managed
-by Fedora:
-
-```bash
-sudo dnf install python3 python3-pip python3-virtualenv
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install 'matrix-nio[e2e]>=0.25.2'
-```
-
-For a normal source checkout, installing the project also installs the Matrix
-dependency:
-
-```bash
-python -m pip install -e .
-```
-
-If `matrix-nio` is not installed, the service logs a clear error and remains
+The normal project installation procedures install the Matrix dependency. If
+`matrix-nio` is not installed, the service logs a clear error and remains
 disabled; other MeshCore services continue to start.
 
 ## Configuration
