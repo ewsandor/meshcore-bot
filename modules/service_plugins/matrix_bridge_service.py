@@ -66,6 +66,7 @@ class QueuedMessage:
     next_retry_at: float = 0.0
 
     def __post_init__(self) -> None:
+        """Initialize queue timestamps when callers omit them."""
         now = time.time()
         if self.first_queued == 0.0:
             self.first_queued = now
@@ -135,6 +136,10 @@ class MatrixBridgeService(BaseServicePlugin):
     ]
 
     def __init__(self, bot: Any):
+        """Create the bridge and load configuration without opening network sessions.
+
+        :param bot: Running MeshCore bot instance that owns the service.
+        """
         super().__init__(bot)
         config = self.bot.config
         self.enabled = config.getboolean(self.config_section, "enabled", fallback=False)
@@ -188,6 +193,7 @@ class MatrixBridgeService(BaseServicePlugin):
             self.verification_enabled = False
 
     def _load_channel_mappings(self) -> None:
+        """Load outbound room mappings and per-channel inbound permissions."""
         if not self.bot.config.has_section(self.config_section):
             return
         for key, value in self.bot.config.items(self.config_section):
@@ -202,6 +208,11 @@ class MatrixBridgeService(BaseServicePlugin):
             self.send_times.setdefault(room_id, deque())
 
     def _load_linked_identities(self) -> None:
+        """Load persisted Matrix-user to MeshCore-public-key associations.
+
+        Invalid entries are ignored so a damaged or hand-edited state file
+        cannot prevent the bridge from starting.
+        """
         try:
             with self._verification_state_path.open(encoding="utf-8") as state_file:
                 loaded = json.load(state_file)
@@ -215,16 +226,19 @@ class MatrixBridgeService(BaseServicePlugin):
             self._linked_meshcore_keys = {}
 
     def _save_linked_identities(self) -> None:
+        """Persist identity links using a same-directory temporary replacement."""
         try:
             self._verification_state_path.parent.mkdir(parents=True, exist_ok=True)
             temporary_path = self._verification_state_path.with_suffix(".tmp")
             with temporary_path.open("w", encoding="utf-8") as state_file:
                 json.dump(self._linked_meshcore_keys, state_file, indent=2, sort_keys=True)
+            # Replace atomically so a process stop cannot leave a half-written JSON file.
             temporary_path.replace(self._verification_state_path)
         except OSError as exc:
             self.logger.error("Could not save Matrix/MeshCore identity links: %s", exc)
 
     def _find_pending_by_mesh_key(self, public_key: str) -> Optional[PendingVerification]:
+        """Find the active verification request for a full MeshCore public key."""
         normalized = public_key.lower()
         return next(
             (pending for pending in self.pending_verifications.values()
@@ -233,6 +247,7 @@ class MatrixBridgeService(BaseServicePlugin):
         )
 
     def _find_linked_user_by_mesh_key(self, public_key: str) -> Optional[str]:
+        """Return the Matrix user already linked to a MeshCore public key, if any."""
         normalized = public_key.lower()
         return next(
             (matrix_user for matrix_user, mesh_key in self._linked_meshcore_keys.items()
@@ -241,6 +256,12 @@ class MatrixBridgeService(BaseServicePlugin):
         )
 
     def _resolve_meshcore_public_key(self, prefix: str) -> Optional[str]:
+        """Resolve an incoming MeshCore sender prefix to a known full public key.
+
+        Challenge replies are accepted only when the prefix resolves through the
+        bot's contact table; display names are intentionally never used as proof
+        of identity.
+        """
         normalized = prefix.strip().lower()
         if validate_pubkey_format(normalized):
             return normalized
@@ -252,15 +273,24 @@ class MatrixBridgeService(BaseServicePlugin):
         return None
 
     async def _send_matrix_status(self, room_id: str, text: str) -> None:
+        """Queue a verification status message for the Matrix room."""
         await self._queue_message(room_id, f"[Matrix verification] {text}", "verification")
 
     def _clear_pending_verification(self, matrix_user_id: str) -> None:
+        """Remove pending state and cancel its timeout task when appropriate."""
         self.pending_verifications.pop(matrix_user_id, None)
         task = self._verification_tasks.pop(matrix_user_id, None)
         if task and task is not asyncio.current_task():
             task.cancel()
 
     async def _handle_matrix_control_message(self, room: Any, event: Any) -> bool:
+        """Handle Matrix-side help and identity-link commands.
+
+        The link request starts on Matrix, but possession is proved only when
+        the same MeshCore public key answers the one-time challenge over radio.
+
+        :return: ``True`` when the message was a Matrix bridge command.
+        """
         if not self.verification_enabled or event.sender == self.user_id:
             return False
         members = getattr(room, "members", None)
@@ -316,6 +346,8 @@ class MatrixBridgeService(BaseServicePlugin):
             await self._send_matrix_status(room.room_id, "That MeshCore identity is already linked to another Matrix account.")
             return True
 
+        # The token is short enough for MeshCore DM limits but random enough to
+        # prevent stale approvals from being replayed for a new request.
         now = time.time()
         challenge = secrets.token_hex(4).upper()
         pending = PendingVerification(
@@ -351,6 +383,7 @@ class MatrixBridgeService(BaseServicePlugin):
         return True
 
     async def _expire_pending_verification(self, matrix_user_id: str, expires_at: float) -> None:
+        """Expire a pending challenge and cancel an active Matrix SAS session."""
         await asyncio.sleep(max(0, expires_at - time.time()))
         pending = self.pending_verifications.get(matrix_user_id)
         if pending and pending.expires_at <= time.time():
@@ -361,6 +394,7 @@ class MatrixBridgeService(BaseServicePlugin):
             await self._send_matrix_status(pending.matrix_room_id, "Verification timed out.")
 
     async def _start_matrix_verification(self, pending: PendingVerification) -> None:
+        """Discover a Matrix device and initiate an outgoing SAS transaction."""
         try:
             response = await self.client.keys_query()
         except Exception as exc:
@@ -371,6 +405,8 @@ class MatrixBridgeService(BaseServicePlugin):
         if not devices:
             await self._send_matrix_status(pending.matrix_room_id, "No Matrix devices were found for that account.")
             return
+        # Prefer the device that sent the link request; otherwise choose a
+        # stable device ID so retries do not select randomly.
         if pending.matrix_device_id and pending.matrix_device_id in devices:
             device = devices[pending.matrix_device_id]
         else:
@@ -399,6 +435,7 @@ class MatrixBridgeService(BaseServicePlugin):
         )
 
     async def _send_sas_over_meshcore(self, pending: PendingVerification) -> None:
+        """Send the bot's SAS emojis over the already-authenticated MeshCore DM."""
         sas = self.client.key_verifications.get(pending.transaction_id or "")
         if not sas:
             return
@@ -419,6 +456,7 @@ class MatrixBridgeService(BaseServicePlugin):
             await self._send_matrix_status(pending.matrix_room_id, "I could not send the emoji sequence over MeshCore.")
 
     async def _on_mesh_verification_message(self, event: Any, metadata: Any = None) -> None:
+        """Process MeshCore challenge and emoji-confirmation replies."""
         payload = copy.deepcopy(getattr(event, "payload", None))
         if not payload:
             return
@@ -456,12 +494,14 @@ class MatrixBridgeService(BaseServicePlugin):
         pending.stage = "matrix_mac"
 
     def _channel_for_room(self, room_id: str) -> Optional[str]:
+        """Return the configured MeshCore channel for a Matrix room."""
         for channel, mapped_room in self.channel_rooms.items():
             if mapped_room == room_id:
                 return channel
         return None
 
     def _truncate(self, text: str) -> str:
+        """Limit outbound Matrix text to the configured Matrix bridge length."""
         if len(text) <= self.max_message_length:
             return text
         return text[: self.max_message_length - 3].rstrip() + "..."
@@ -471,10 +511,12 @@ class MatrixBridgeService(BaseServicePlugin):
         await self._queue_message(room_id, f"[Matrix bridge] {notice}", channel)
 
     def _format_outbound(self, sender: str, text: str, channel: str) -> str:
+        """Format a MeshCore message as plain Matrix text."""
         text = text.replace("@[", "@").replace("]", "")
         return self._truncate(f"[{channel}] {sender}: {text}")
 
     def _passes_filter(self, sender: str, text: str) -> tuple[str, str] | None:
+        """Apply the configured profanity policy to a sender and message body."""
         if self.filter_profanity == "drop" and (
             contains_profanity(sender, self.logger) or contains_profanity(text, self.logger)
         ):
@@ -485,6 +527,7 @@ class MatrixBridgeService(BaseServicePlugin):
         return sender, text
 
     async def start(self) -> None:
+        """Start Matrix sync, MeshCore subscriptions, and the outbound queue worker."""
         if not self.enabled or (not self.channel_rooms and not self.verification_enabled):
             return
         client_config = AsyncClientConfig(
@@ -498,6 +541,8 @@ class MatrixBridgeService(BaseServicePlugin):
         self.client.access_token = self.access_token
         self.client.add_event_callback(self._on_matrix_message, RoomMessageText)
         if self.verification_enabled and self.encryption_enabled:
+            # Verification uses Matrix to-device events; it is separate from
+            # ordinary room-text callbacks and must be registered explicitly.
             self.client.add_to_device_callback(self._on_matrix_verification_event, KeyVerificationEvent)
         self._running = True
         self._sync_task = asyncio.create_task(self._sync_matrix())
@@ -510,6 +555,7 @@ class MatrixBridgeService(BaseServicePlugin):
         self._queue_processor_task = asyncio.create_task(self._process_message_queues())
 
     async def _sync_matrix(self) -> None:
+        """Run the long-lived Matrix sync loop until cancellation or failure."""
         try:
             await self.client.sync_forever(timeout=30000, full_state=True)
         except asyncio.CancelledError:
@@ -518,6 +564,7 @@ class MatrixBridgeService(BaseServicePlugin):
             self.logger.error("Matrix sync stopped: %s", exc, exc_info=True)
 
     async def stop(self) -> None:
+        """Stop workers, remove listeners, cancel verification timers, and close nio."""
         self._running = False
         if getattr(self.bot, "channel_sent_listeners", None) is not None:
             with contextlib.suppress(ValueError):
@@ -539,6 +586,7 @@ class MatrixBridgeService(BaseServicePlugin):
             self.client = None
 
     async def on_transport_reconnected(self) -> None:
+        """Restore MeshCore subscriptions after the bot replaces its transport."""
         if not self._running or not getattr(self.bot, "meshcore", None):
             return
         self.bot.meshcore.subscribe(EventType.CHANNEL_MSG_RECV, self._on_mesh_channel_message)
@@ -546,6 +594,7 @@ class MatrixBridgeService(BaseServicePlugin):
             self.bot.meshcore.subscribe(EventType.CONTACT_MSG_RECV, self._on_mesh_verification_message)
 
     async def _on_mesh_channel_message(self, event: Any, metadata: Any = None) -> None:
+        """Queue a configured MeshCore channel message for its Matrix room."""
         payload = copy.deepcopy(getattr(event, "payload", None))
         if not payload:
             return
@@ -568,10 +617,12 @@ class MatrixBridgeService(BaseServicePlugin):
         await self._queue_message(room_id, self._format_outbound(*filtered, channel), channel)
 
     async def _queue_message(self, room_id: str, body: str, channel: str) -> None:
+        """Append one Matrix message to the per-room retry queue."""
         self.message_queues.setdefault(room_id, []).append(QueuedMessage(room_id, body, channel))
         self.send_times.setdefault(room_id, deque())
 
     async def _process_message_queues(self) -> None:
+        """Send queued Matrix messages with per-room pacing and exponential retry."""
         while self._running:
             now = time.time()
             for room_id, queue in list(self.message_queues.items()):
@@ -580,6 +631,8 @@ class MatrixBridgeService(BaseServicePlugin):
                 message = next((item for item in queue if now >= item.next_retry_at), None)
                 if message is None:
                     continue
+                # Old messages are discarded rather than sent late; retrying
+                # stale bridge traffic is more confusing than dropping it.
                 success = now - message.first_queued > self.max_queue_age or await self._send_room_message(message)
                 if success:
                     queue.remove(message)
@@ -593,6 +646,7 @@ class MatrixBridgeService(BaseServicePlugin):
             await asyncio.sleep(0.1)
 
     async def _send_room_message(self, message: QueuedMessage) -> bool:
+        """Send one queued Matrix room message and report nio success."""
         try:
             response = await self.client.room_send(
                 room_id=message.room_id,
@@ -605,6 +659,7 @@ class MatrixBridgeService(BaseServicePlugin):
             return False
 
     async def _on_matrix_message(self, room: Any, event: Any) -> None:
+        """Route Matrix room text to verification commands or MeshCore channels."""
         if await self._handle_matrix_control_message(room, event):
             return
         channel = self._channel_for_room(room.room_id)
@@ -624,6 +679,8 @@ class MatrixBridgeService(BaseServicePlugin):
         chunks = self.bot.command_manager.split_text_into_utf8_chunks(
             message, MESHCORE_CHANNEL_MESSAGE_MAX_BYTES
         )
+        # Reuse CommandManager's byte-safe splitter and transmission pacing so
+        # Matrix input obeys the same radio constraints as native bot replies.
         sent = await self.bot.command_manager.send_channel_messages_chunked(
             channel, chunks, skip_user_rate_limit=True,
         )
@@ -648,6 +705,7 @@ class MatrixBridgeService(BaseServicePlugin):
             )
 
     async def _on_matrix_verification_event(self, event: Any) -> None:
+        """Advance the outgoing Matrix SAS transaction from nio to completion."""
         transaction_id = getattr(event, "transaction_id", None)
         if not transaction_id:
             return
@@ -673,6 +731,8 @@ class MatrixBridgeService(BaseServicePlugin):
             sas = self.client.key_verifications.get(transaction_id)
             if not sas:
                 return
+            # nio validates the peer MAC before exposing ``verified``. Do not
+            # persist the cross-network link merely because a MAC event arrived.
             if not sas.verified:
                 await self._send_matrix_status(
                     pending.matrix_room_id,
