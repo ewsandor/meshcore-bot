@@ -110,3 +110,35 @@ async def test_wrong_meshcore_challenge_is_ignored(tmp_path):
 
     service.client.keys_query.assert_not_awaited()
     assert pending.stage == "mesh_challenge"
+
+
+@pytest.mark.asyncio
+async def test_matrix_user_cannot_replace_pending_request(tmp_path):
+    service = make_service(tmp_path)
+    service.pending_verifications["@alice:example.org"] = PendingVerification(
+        matrix_user_id="@alice:example.org",
+        matrix_room_id="!dm:example.org",
+        meshcore_public_key="ab" * 32,
+        challenge="A1B2C3D4",
+        created_at=1.0,
+        expires_at=9999999999.0,
+    )
+    service._send_matrix_status = AsyncMock()
+
+    handled = await service._handle_matrix_control_message(
+        SimpleNamespace(room_id="!dm:example.org"),
+        SimpleNamespace(sender="@alice:example.org", body="link meshcore " + "cd" * 32),
+    )
+
+    assert handled is True
+    assert service.pending_verifications["@alice:example.org"].meshcore_public_key == "ab" * 32
+    service.bot.command_manager.send_dm.assert_not_awaited()
+
+
+def test_verification_is_disabled_when_encryption_is_disabled(tmp_path):
+    service = make_service(tmp_path)
+    service.bot.config.set("MatrixBridge", "encryption_enabled", "false")
+
+    service = MatrixBridgeService(service.bot)
+
+    assert service.verification_enabled is False

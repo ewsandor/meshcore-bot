@@ -183,6 +183,9 @@ class MatrixBridgeService(BaseServicePlugin):
         elif not self.homeserver or not self.user_id or not self.access_token:
             self.logger.error("Matrix bridge requires homeserver, user_id, and access_token.")
             self.enabled = False
+        elif self.verification_enabled and not self.encryption_enabled:
+            self.logger.error("Matrix identity verification requires encryption_enabled=true.")
+            self.verification_enabled = False
 
     def _load_channel_mappings(self) -> None:
         if not self.bot.config.has_section(self.config_section):
@@ -229,6 +232,14 @@ class MatrixBridgeService(BaseServicePlugin):
             None,
         )
 
+    def _find_linked_user_by_mesh_key(self, public_key: str) -> Optional[str]:
+        normalized = public_key.lower()
+        return next(
+            (matrix_user for matrix_user, mesh_key in self._linked_meshcore_keys.items()
+             if mesh_key.lower() == normalized),
+            None,
+        )
+
     def _resolve_meshcore_public_key(self, prefix: str) -> Optional[str]:
         normalized = prefix.strip().lower()
         if validate_pubkey_format(normalized):
@@ -243,8 +254,17 @@ class MatrixBridgeService(BaseServicePlugin):
     async def _send_matrix_status(self, room_id: str, text: str) -> None:
         await self._queue_message(room_id, f"[Matrix verification] {text}", "verification")
 
+    def _clear_pending_verification(self, matrix_user_id: str) -> None:
+        self.pending_verifications.pop(matrix_user_id, None)
+        task = self._verification_tasks.pop(matrix_user_id, None)
+        if task and task is not asyncio.current_task():
+            task.cancel()
+
     async def _handle_matrix_control_message(self, room: Any, event: Any) -> bool:
         if not self.verification_enabled or event.sender == self.user_id:
+            return False
+        members = getattr(room, "members", None)
+        if members is not None and len(members) > 2:
             return False
         content = event.body.strip()
         if content.lower() in ("help", "matrix help", "link help"):
@@ -288,6 +308,13 @@ class MatrixBridgeService(BaseServicePlugin):
         if self._find_pending_by_mesh_key(public_key):
             await self._send_matrix_status(room.room_id, "A verification request for that MeshCore identity is already pending.")
             return True
+        if event.sender in self.pending_verifications:
+            await self._send_matrix_status(room.room_id, "A verification request for this Matrix account is already pending.")
+            return True
+        linked_user = self._find_linked_user_by_mesh_key(public_key)
+        if linked_user and linked_user != event.sender:
+            await self._send_matrix_status(room.room_id, "That MeshCore identity is already linked to another Matrix account.")
+            return True
 
         now = time.time()
         challenge = secrets.token_hex(4).upper()
@@ -304,7 +331,7 @@ class MatrixBridgeService(BaseServicePlugin):
         self.pending_verifications[event.sender] = pending
         sent = await self.bot.command_manager.send_dm(
             public_key,
-            f"MATRIX LINK {challenge}\\nReply: VERIFY {challenge}",
+            f"MATRIX LINK {challenge}\nReply: VERIFY {challenge}",
             skip_user_rate_limit=True,
         )
         if not sent:
@@ -319,7 +346,8 @@ class MatrixBridgeService(BaseServicePlugin):
             "A one-time challenge was sent over MeshCore. Reply to it with the requested text; "
             f"this request expires in {self.verification_timeout_seconds // 60} minutes.",
         )
-        asyncio.create_task(self._expire_pending_verification(event.sender, pending.expires_at))
+        expiry_task = asyncio.create_task(self._expire_pending_verification(event.sender, pending.expires_at))
+        self._verification_tasks[event.sender] = expiry_task
         return True
 
     async def _expire_pending_verification(self, matrix_user_id: str, expires_at: float) -> None:
@@ -329,35 +357,45 @@ class MatrixBridgeService(BaseServicePlugin):
             if pending.transaction_id:
                 with contextlib.suppress(Exception):
                     await self.client.cancel_key_verification(pending.transaction_id)
-                self._verification_tasks.pop(pending.transaction_id, None)
-            self.pending_verifications.pop(matrix_user_id, None)
+            self._clear_pending_verification(matrix_user_id)
             await self._send_matrix_status(pending.matrix_room_id, "Verification timed out.")
 
     async def _start_matrix_verification(self, pending: PendingVerification) -> None:
-        response = await self.client.keys_query()
+        try:
+            response = await self.client.keys_query()
+        except Exception as exc:
+            self.logger.warning("Matrix device lookup failed for %s: %s", pending.matrix_user_id, exc)
+            await self._send_matrix_status(pending.matrix_room_id, "I could not look up Matrix devices right now.")
+            return
         devices = getattr(response, "device_keys", {}).get(pending.matrix_user_id, {})
+        if not devices:
+            await self._send_matrix_status(pending.matrix_room_id, "No Matrix devices were found for that account.")
+            return
         if pending.matrix_device_id and pending.matrix_device_id in devices:
             device = devices[pending.matrix_device_id]
-        elif len(devices) == 1:
-            device = next(iter(devices.values()))
-            pending.matrix_device_id = getattr(device, "device_id", None)
         else:
-            await self._send_matrix_status(
-                pending.matrix_room_id,
-                "I found multiple Matrix devices. Start emoji verification from the Matrix device "
-                "you want to verify, or retry from a direct encrypted Matrix chat.",
-            )
-            return
+            pending.matrix_device_id = sorted(devices)[0]
+            device = devices[pending.matrix_device_id]
         transaction_id = secrets.token_hex(16)
-        response = await self.client.start_key_verification(device, transaction_id)
+        try:
+            response = await self.client.start_key_verification(device, transaction_id)
+        except Exception as exc:
+            self.logger.warning("Matrix verification start failed for %s: %s", pending.matrix_user_id, exc)
+            await self._send_matrix_status(pending.matrix_room_id, "Matrix verification could not be started.")
+            return
         if isinstance(response, ToDeviceError):
             await self._send_matrix_status(pending.matrix_room_id, "Matrix verification could not be started.")
             return
         pending.transaction_id = transaction_id
         pending.stage = "matrix_sas"
+        device_note = (
+            f" I selected Matrix device {pending.matrix_device_id}."
+            if len(devices) > 1 else ""
+        )
         await self._send_matrix_status(
             pending.matrix_room_id,
-            "Matrix emoji verification has started. I will send my emoji sequence over MeshCore.",
+            "Matrix emoji verification has started." + device_note +
+            " I will send my emoji sequence over MeshCore.",
         )
 
     async def _send_sas_over_meshcore(self, pending: PendingVerification) -> None:
@@ -367,7 +405,7 @@ class MatrixBridgeService(BaseServicePlugin):
         emoji_text = " ".join(emoji for emoji, _description in sas.get_emoji())
         sent = await self.bot.command_manager.send_dm(
             pending.meshcore_public_key,
-            f"MATRIX EMOJIS {emoji_text}\\nReply: YES {pending.challenge} or NO {pending.challenge}",
+            f"MATRIX EMOJIS {emoji_text}\nReply: YES {pending.challenge} or NO {pending.challenge}",
             skip_user_rate_limit=True,
         )
         if sent:
@@ -402,11 +440,16 @@ class MatrixBridgeService(BaseServicePlugin):
             with contextlib.suppress(Exception):
                 await self.client.cancel_key_verification(pending.transaction_id or "", reject=True)
             await self._send_matrix_status(pending.matrix_room_id, "Verification was rejected over MeshCore.")
-            self.pending_verifications.pop(pending.matrix_user_id, None)
+            self._clear_pending_verification(pending.matrix_user_id)
             return
         if text.upper() != f"YES {pending.challenge}":
             return
-        response = await self.client.confirm_short_auth_string(pending.transaction_id or "")
+        try:
+            response = await self.client.confirm_short_auth_string(pending.transaction_id or "")
+        except Exception as exc:
+            self.logger.warning("Matrix verification confirmation failed: %s", exc)
+            await self._send_matrix_status(pending.matrix_room_id, "Matrix could not confirm the emoji verification.")
+            return
         if isinstance(response, ToDeviceError):
             await self._send_matrix_status(pending.matrix_room_id, "Matrix could not confirm the emoji verification.")
             return
@@ -442,7 +485,7 @@ class MatrixBridgeService(BaseServicePlugin):
         return sender, text
 
     async def start(self) -> None:
-        if not self.enabled or not self.channel_rooms:
+        if not self.enabled or (not self.channel_rooms and not self.verification_enabled):
             return
         client_config = AsyncClientConfig(
             encryption_enabled=self.encryption_enabled,
@@ -485,8 +528,11 @@ class MatrixBridgeService(BaseServicePlugin):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
-        for task in self._verification_tasks.values():
+        tasks = list(self._verification_tasks.values())
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._verification_tasks.clear()
         if self.client:
             await self.client.close()
@@ -627,11 +673,22 @@ class MatrixBridgeService(BaseServicePlugin):
             sas = self.client.key_verifications.get(transaction_id)
             if not sas:
                 return
-            with contextlib.suppress(Exception):
+            if not sas.verified:
+                await self._send_matrix_status(
+                    pending.matrix_room_id,
+                    "Matrix verification failed because the received key confirmation was invalid.",
+                )
+                self._clear_pending_verification(pending.matrix_user_id)
+                return
+            try:
                 response = await self.client.to_device(sas.get_mac())
-                if isinstance(response, ToDeviceError):
-                    await self._send_matrix_status(pending.matrix_room_id, "Matrix verification could not complete.")
-                    return
+            except Exception as exc:
+                self.logger.warning("Matrix verification MAC exchange failed: %s", exc)
+                await self._send_matrix_status(pending.matrix_room_id, "Matrix verification could not complete.")
+                return
+            if isinstance(response, ToDeviceError):
+                await self._send_matrix_status(pending.matrix_room_id, "Matrix verification could not complete.")
+                return
             self._linked_meshcore_keys[pending.matrix_user_id] = pending.meshcore_public_key
             self._save_linked_identities()
             await self._send_matrix_status(
@@ -643,11 +700,11 @@ class MatrixBridgeService(BaseServicePlugin):
                 "Matrix verification succeeded; your MeshCore identity is linked.",
                 skip_user_rate_limit=True,
             )
-            self.pending_verifications.pop(pending.matrix_user_id, None)
+            self._clear_pending_verification(pending.matrix_user_id)
             return
         if isinstance(event, KeyVerificationCancel):
             await self._send_matrix_status(
                 pending.matrix_room_id,
                 f"Verification failed or was cancelled: {getattr(event, 'reason', 'unknown reason')}.",
             )
-            self.pending_verifications.pop(pending.matrix_user_id, None)
+            self._clear_pending_verification(pending.matrix_user_id)
