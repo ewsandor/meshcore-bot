@@ -28,7 +28,6 @@ device_id = MESHCOREBOT
 store_path = data/matrix-store
 encryption_enabled = true
 bridge.Public = !roomid:example.org
-inbound.Public = false
 ```
 
 Set `inbound.<channel> = true` only for channels that should accept Matrix
@@ -38,10 +37,17 @@ directions. Matrix messages routed to MeshCore are split into ordered UTF-8
 chunks no larger than the MeshCore 133-byte channel-message limit and use the
 bot's standard chunk pacing and transmission rate limiting.
 
-## Identity verification
+In the web settings editor, the inbound option is a checkbox on the same
+channel-mapping row, so the channel name only needs to be entered once. The
+manual `inbound.<channel>` form remains supported for configuration files.
 
-When `verification_enabled = true`, a user can start a cross-network identity
-link from a Matrix DM:
+## Experimental identity verification
+
+E2E encryption is enabled by default. Identity verification is experimental and
+disabled by default. Set `verification_enabled = true` only when you want to
+enable the cross-network identity-link flow.
+
+When enabled, a user can start a cross-network identity link from a Matrix DM:
 
 ```text
 link meshcore <64-character MeshCore public key>

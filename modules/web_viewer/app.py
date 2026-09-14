@@ -90,7 +90,7 @@ class NeighborEvidenceKeys(NamedTuple):
     public_keys: set[tuple[str, str]]
 
 
-def _validate_dynamic_key(key: str) -> "str | None":
+def _validate_dynamic_key(key: str, *, allow_hash_prefix: bool = False) -> "str | None":
     """Validate a dynamic-section row key. Returns an error message or None.
 
     Keys become INI option names, so they must not contain the separators or
@@ -98,7 +98,7 @@ def _validate_dynamic_key(key: str) -> "str | None":
     """
     if any(ch in key for ch in ('=', ':', '\n', '\r', '[', ']')):
         return f'Invalid key "{key}": cannot contain = : [ ] or newlines'
-    if key[:1] in ('#', ';'):
+    if key[:1] == ';' or (key[:1] == '#' and not allow_hash_prefix):
         return f'Invalid key "{key}": cannot start with # or ;'
     return None
 
@@ -1467,13 +1467,17 @@ class BotDataViewer:
                     new_full: dict[str, str] = {}
                     seen_full: set[str] = set()
                     seen_disp: set[str] = set()
+                    companion_full: dict[str, str] = {}
+                    companion_seen: set[str] = set()
                     for row in rows:
                         rkey = (str(row.get('key', '')) or '').strip()
                         rval = row.get('value', '')
                         rval = '' if rval is None else str(rval)
                         if not rkey:
                             continue  # skip blank rows
-                        key_err = _validate_dynamic_key(rkey)
+                        key_err = _validate_dynamic_key(
+                            rkey, allow_hash_prefix=bool(ds.get('allow_hash_prefix', False))
+                        )
                         if key_err:
                             return jsonify({'success': False, 'error': key_err}), 400
                         if rkey.lower() in seen_disp:
@@ -1483,8 +1487,26 @@ class BotDataViewer:
                         full = f"{prefix}{rkey}"
                         new_full[full] = rval
                         seen_full.add(full.lower())
+                        if ds.get('checkbox_section'):
+                            checkbox_prefix = ds.get('checkbox_prefix', '') or ''
+                            companion_key = f"{checkbox_prefix}{rkey}"
+                            companion_full[companion_key] = 'true' if row.get('inbound', False) else 'false'
+                            companion_seen.add(companion_key.lower())
                     # Merge into the target section (own section keeps schema fields).
                     updates.setdefault(dsec, {}).update(new_full)
+                    if ds.get('checkbox_section'):
+                        companion_section = ds['checkbox_section']
+                        updates.setdefault(companion_section, {}).update(companion_full)
+                        existing_companion = (
+                            self.config.items(companion_section, raw=True)
+                            if self.config.has_section(companion_section) else []
+                        )
+                        companion_prefix = ds.get('checkbox_prefix', '') or ''
+                        deletes.setdefault(companion_section, []).extend(
+                            key for key, _ in existing_companion
+                            if key.lower().startswith(companion_prefix.lower())
+                            and key.lower() not in companion_seen
+                        )
                     # Delete existing managed keys that are no longer present.
                     existing = self.config.items(dsec, raw=True) if self.config.has_section(dsec) else []
                     pl = prefix.lower()

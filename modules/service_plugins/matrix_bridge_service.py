@@ -119,7 +119,7 @@ class MatrixBridgeService(BaseServicePlugin):
         {"key": "bridge_bot_responses", "label": "Bridge bot responses", "type": "bool",
          "default": True, "help": "Also bridge the bot's own channel replies."},
         {"key": "verification_enabled", "label": "Enable identity verification", "type": "bool",
-         "default": True, "help": "Allow Matrix users to link and verify a MeshCore identity."},
+         "default": False, "help": "Experimental: allow Matrix users to link and verify a MeshCore identity."},
         {"key": "verification_timeout_seconds", "label": "Verification timeout", "type": "int",
          "min": 30, "max": 3600, "default": 300,
          "help": "Seconds before a pending identity or SAS verification expires."},
@@ -127,12 +127,10 @@ class MatrixBridgeService(BaseServicePlugin):
     settings_dynamic_sections = [
         {"section": "MatrixBridge", "key_prefix": "bridge.",
          "label": "Channel mappings", "key_label": "MeshCore channel", "value_label": "Matrix room ID",
-         "help": "Map a MeshCore channel to a Matrix room ID. DMs are never bridged.",
-         "key_placeholder": "Public", "value_placeholder": "!room:example.org"},
-        {"section": "MatrixBridge", "key_prefix": "inbound.",
-         "label": "Inbound channel mappings", "key_label": "MeshCore channel", "value_label": "Enabled",
-         "help": "Set true to relay text from the mapped Matrix room back to this MeshCore channel.",
-         "key_placeholder": "Public", "value_placeholder": "true"},
+         "help": "Map a MeshCore channel to a Matrix room ID. Use the checkbox to enable Matrix -> MeshCore routing. DMs are never bridged.",
+         "key_placeholder": "Public", "value_placeholder": "!room:example.org",
+         "checkbox_section": "MatrixBridge", "checkbox_prefix": "inbound.",
+         "checkbox_label": "Matrix -> MeshCore", "allow_hash_prefix": True},
     ]
 
     def __init__(self, bot: Any):
@@ -158,11 +156,13 @@ class MatrixBridgeService(BaseServicePlugin):
         raw_filter = config.get(self.config_section, "filter_profanity", fallback="drop").strip().lower()
         self.filter_profanity = raw_filter if raw_filter in ("drop", "censor", "off") else "drop"
         self.bridge_bot_responses = config.getboolean(self.config_section, "bridge_bot_responses", fallback=True)
-        self.verification_enabled = config.getboolean(self.config_section, "verification_enabled", fallback=True)
+        self.verification_enabled = config.getboolean(self.config_section, "verification_enabled", fallback=False)
         self.verification_timeout_seconds = min(
             max(30, config.getint(self.config_section, "verification_timeout_seconds", fallback=300)),
             3600,
         )
+        self.message_queues: dict[str, list[QueuedMessage]] = {}
+        self.send_times: dict[str, deque] = {}
         self.channel_rooms: dict[str, str] = {}
         self.inbound_channels: set[str] = set()
         self._load_channel_mappings()
@@ -170,8 +170,6 @@ class MatrixBridgeService(BaseServicePlugin):
         self.client: Optional[Any] = None
         self._sync_task: Optional[asyncio.Task] = None
         self._queue_processor_task: Optional[asyncio.Task] = None
-        self.message_queues: dict[str, list[QueuedMessage]] = {}
-        self.send_times: dict[str, deque] = {}
         self.rate_limit_min_interval = 1.0
         self.max_retries = 5
         self.retry_delay_base = 1.0
@@ -528,7 +526,14 @@ class MatrixBridgeService(BaseServicePlugin):
 
     async def start(self) -> None:
         """Start Matrix sync, MeshCore subscriptions, and the outbound queue worker."""
-        if not self.enabled or (not self.channel_rooms and not self.verification_enabled):
+        if not self.enabled:
+            return
+        if not self.channel_rooms and not self.verification_enabled:
+            # An enabled service with no mappings is an intentional no-op, not
+            # a failed start. Mark it healthy so the generic service watchdog
+            # does not restart it every health interval.
+            self.logger.info("Matrix bridge has no channel mappings and verification is disabled; idle")
+            self._running = True
             return
         client_config = AsyncClientConfig(
             encryption_enabled=self.encryption_enabled,

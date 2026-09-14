@@ -19,6 +19,7 @@ def make_service(tmp_path):
     bot.config.set("MatrixBridge", "user_id", "@bot:example.org")
     bot.config.set("MatrixBridge", "access_token", "test-token")
     bot.config.set("MatrixBridge", "store_path", str(tmp_path / "matrix-store"))
+    bot.config.set("MatrixBridge", "verification_enabled", "true")
     bot.meshcore = MagicMock()
     bot.command_manager = MagicMock()
     bot.command_manager.send_dm = AsyncMock(return_value=True)
@@ -142,3 +143,15 @@ def test_verification_is_disabled_when_encryption_is_disabled(tmp_path):
     service = MatrixBridgeService(service.bot)
 
     assert service.verification_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_enabled_idle_bridge_is_healthy_without_mappings(tmp_path):
+    service = make_service(tmp_path)
+    service.verification_enabled = False
+    service.channel_rooms = {}
+
+    await service.start()
+
+    assert service._running is True
+    await service.stop()

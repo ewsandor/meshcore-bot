@@ -362,6 +362,7 @@ class PluginsManager {
         // Dynamic key/value section editors (add/edit/delete rows).
         const dynamicEditors = [];
         (plugin.dynamic_sections || []).forEach(ds => {
+            if (ds.hidden) return;
             const editor = buildDynamicEditor(ds);
             form.appendChild(editor.el);
             dynamicEditors.push(editor);
@@ -446,7 +447,7 @@ class PluginsManager {
         const dynamicPayload = {};
         dynamicEditors.forEach(ed => {
             const rows = ed.getRows();
-            const err = validateDynamicRows(rows);
+            const err = validateDynamicRows(rows, ed.allowHashPrefix);
             if (err && !firstError) firstError = err;
             if (JSON.stringify(rows) !== ed.original) changedCount++;
             dynamicPayload[ed.section] = rows;
@@ -671,16 +672,22 @@ function buildDynamicEditor(ds) {
     keyHeading.className = 'col-md-5';
     keyHeading.textContent = String(ds.key_label ?? '');
     const valueHeading = document.createElement('div');
-    valueHeading.className = 'col-md-6';
+    valueHeading.className = ds.checkbox_section ? 'col-md-4' : 'col-md-6';
     valueHeading.textContent = String(ds.value_label ?? '');
     colhead.append(keyHeading, valueHeading);
+    if (ds.checkbox_section) {
+        const checkboxHeading = document.createElement('div');
+        checkboxHeading.className = 'col-md-2';
+        checkboxHeading.textContent = String(ds.checkbox_label ?? '');
+        colhead.appendChild(checkboxHeading);
+    }
     el.appendChild(colhead);
 
     const rowsContainer = document.createElement('div');
     rowsContainer.className = 'dynamic-rows';
     el.appendChild(rowsContainer);
 
-    const addRow = (key = '', value = '') => {
+    const addRow = (key = '', value = '', checked = false) => {
         const row = document.createElement('div');
         row.className = 'row g-2 align-items-center mb-1 dynamic-row';
         const kc = document.createElement('div'); kc.className = 'col-12 col-md-5';
@@ -688,23 +695,33 @@ function buildDynamicEditor(ds) {
         ki.type = 'text'; ki.className = 'form-control form-control-sm dyn-key';
         ki.placeholder = ds.key_placeholder || ''; ki.value = key;
         kc.appendChild(ki);
-        const vc = document.createElement('div'); vc.className = 'col-10 col-md-6';
+        const vc = document.createElement('div'); vc.className = ds.checkbox_section ? 'col-12 col-md-4' : 'col-10 col-md-6';
         const vi = document.createElement('input');
         vi.type = 'text'; vi.className = 'form-control form-control-sm dyn-value';
         vi.placeholder = ds.value_placeholder || ''; vi.value = value;
         vc.appendChild(vi);
-        const bc = document.createElement('div'); bc.className = 'col-2 col-md-1 text-end';
+        let checkbox;
+        if (ds.checkbox_section) {
+            const cc = document.createElement('div'); cc.className = 'col-10 col-md-2 form-check form-switch';
+            checkbox = document.createElement('input');
+            checkbox.type = 'checkbox'; checkbox.className = 'form-check-input dyn-checkbox';
+            checkbox.checked = checked;
+            cc.appendChild(checkbox);
+            row.appendChild(kc); row.appendChild(vc); row.appendChild(cc);
+        }
+        const bc = document.createElement('div'); bc.className = ds.checkbox_section ? 'col-2 col-md-1 text-end' : 'col-2 col-md-1 text-end';
         const rm = document.createElement('button');
         rm.type = 'button'; rm.className = 'btn btn-outline-danger btn-sm';
         rm.title = 'Remove'; rm.innerHTML = '<i class="fas fa-trash"></i>';
         rm.addEventListener('click', () => row.remove());
         bc.appendChild(rm);
-        row.appendChild(kc); row.appendChild(vc); row.appendChild(bc);
+        if (!ds.checkbox_section) { row.appendChild(kc); row.appendChild(vc); }
+        row.appendChild(bc);
         rowsContainer.appendChild(row);
         return row;
     };
 
-    (ds.items || []).forEach(it => addRow(it.key, it.value));
+    (ds.items || []).forEach(it => addRow(it.key, it.value, (ds.checkbox_items || {})[it.key] === true));
 
     const addBtn = document.createElement('button');
     addBtn.type = 'button';
@@ -722,21 +739,29 @@ function buildDynamicEditor(ds) {
             const key = r.querySelector('.dyn-key').value.trim();
             const value = r.querySelector('.dyn-value').value;
             if (key === '' && value.trim() === '') return;  // skip blank rows
-            out.push({ key, value });
+            const rowData = { key, value };
+            if (ds.checkbox_section) rowData.inbound = r.querySelector('.dyn-checkbox').checked;
+            out.push(rowData);
         });
         return out;
     };
 
     // Snapshot via getRows() so change-detection matches the save serialization.
-    return { section: ds.section, el, getRows, original: JSON.stringify(getRows()) };
+    return {
+        section: ds.section,
+        el,
+        getRows,
+        allowHashPrefix: Boolean(ds.allow_hash_prefix),
+        original: JSON.stringify(getRows()),
+    };
 }
 
-function validateDynamicRows(rows) {
+function validateDynamicRows(rows, allowHashPrefix = false) {
     const seen = new Set();
     for (const { key } of rows) {
         if (key === '') return 'A list row is missing its key';
         if (/[=:\[\]\n\r]/.test(key)) return `Invalid key "${key}": cannot contain = : [ ] or newlines`;
-        if (key[0] === '#' || key[0] === ';') return `Invalid key "${key}": cannot start with # or ;`;
+        if (key[0] === ';' || (key[0] === '#' && !allowHashPrefix)) return `Invalid key "${key}": cannot start with # or ;`;
         if (seen.has(key.toLowerCase())) return `Duplicate key "${key}"`;
         seen.add(key.toLowerCase());
     }

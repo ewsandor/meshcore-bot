@@ -2381,13 +2381,17 @@ enabled = false
 # Keep these stable for encrypted rooms. The store path must be writable and persistent.
 # device_id = MESHCOREBOT
 # store_path = data/matrix-store
+# E2E encryption is enabled by default.
 # encryption_enabled = true
 
 # Optional settings
 # max_message_length = 4096
 # filter_profanity = drop
 # bridge_bot_responses = true
-# verification_enabled = true
+
+# Experimental cross-network identity verification. Disabled by default.
+# Enable only after reviewing docs/matrix-bridge.md.
+# verification_enabled = false
 # verification_timeout_seconds = 300
 
 # Map MeshCore channels to Matrix room IDs. DMs are never bridged.

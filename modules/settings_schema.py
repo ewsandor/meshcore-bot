@@ -472,5 +472,16 @@ def _read_dynamic_sections(config: configparser.ConfigParser, cls: type) -> list
             "key_placeholder": ds.get("key_placeholder", ""),
             "value_placeholder": ds.get("value_placeholder", ""),
             "items": read_section_items(config, sec, prefix),
+            "hidden": bool(ds.get("hidden", False)),
+            "checkbox_section": ds.get("checkbox_section", ""),
+            "checkbox_prefix": ds.get("checkbox_prefix", ""),
+            "checkbox_label": ds.get("checkbox_label", ""),
+            "allow_hash_prefix": bool(ds.get("allow_hash_prefix", False)),
+            "checkbox_items": {
+                item["key"]: str(item["value"]).strip().lower() in ("1", "true", "yes", "on")
+                for item in read_section_items(
+                    config, ds.get("checkbox_section", ""), ds.get("checkbox_prefix", "")
+                )
+            },
         })
     return result
